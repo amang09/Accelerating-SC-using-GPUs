@@ -1,0 +1,197 @@
+#include <cmath>
+#include <time.h>
+#include <cstdlib>
+#include <iostream>
+
+
+const int NX = 80;
+const int NY = 80;
+
+inline int indx(const int i, const int j) { return i + NY * j; }
+
+double linf_norm(const double *u1, const double *u2, const int sz) {
+  double max = 0.0;
+  for (int i = 0; i < sz; ++i) {
+    if (std::abs(u1[i] - u2[i]) > max) {
+      max = std::abs(u1[i] - u2[i]);
+    }
+  }
+  return max;
+}
+
+double l2_norm(const double *u1, const double *u2, const int sz) {
+  double rms = 0.0;
+  for (int i=0; i < sz; ++i) {
+    rms += std::abs(u1[i] - u2[i])*std::abs(u1[i] - u2[i]);
+  }
+  rms = sqrt (rms / sz);
+  return rms;
+}
+
+double (*mynorm)(const double *, const double *, const int) = l2_norm;
+
+
+__global__ void sweep(double *u,double *uo,double *rh, double dx, double * diff,int *counter){
+
+  // The magnitude of u is of the order of 1, so we will make the convergence
+  // criterion as 1.e-14 times 1, i.e., simply 1.e-14
+  double tol = 1.e-10;
+
+  // Initialize the difference between old and new solutions
+   diff[0] = 1.0;
+  
+  // counter to store number of iterations
+   
+  while (diff[*counter] > tol || counter<=4000) { // main while loop
+    // copy  u to uold
+    for (int i = 0; i < NX * NY; ++i) {
+      uo[i] = u[i];
+    }
+
+    // Perform the Jacobi iteration (only on interior cells)
+    for (int j = 1; j < NY - 1; ++j) {
+      for (int i = 1; i < NX - 1; ++i) {
+        // here we assume that dx = dy
+        u[indx(i, j)] = 0.25 * (uo[indx(i + 1, j)] + uo[indx(i, j + 1)] +
+                                uo[indx(i - 1, j)] + uo[indx(i, j - 1)] +
+                                (dx * dx) * rh[indx(i, j)]);
+      }
+    }
+    
+    *counter++;
+    diff[*counter] = mynorm(u, uo, NX*NY);
+    //std::cout << "Iteration " << counter << ": diff = " << diff << std::endl;
+    
+  }
+}
+
+// Problem: -(d2u/dx2 + d2u/dy2) = f(x,y)
+// uexact = sin(pi*x)*cos(pi*y); f(x,y) = 2*pi2*sin(pi*x)*cos(pi*y)
+
+int main(int argc, char *argv[]) {
+     double time_spent = 0.0;
+ 
+    clock_t begin = clock();
+  
+    
+  double *u = (double *)malloc(NX * NY * sizeof(double));   // solution
+  double *ue = (double *)malloc(NX * NY * sizeof(double));  // exact solution
+  double *uo =
+      (double *)malloc(NX * NY * sizeof(double));  // sol. from prev. iteration
+  double *rh = (double *)malloc(
+      NX * NY * sizeof(double));  // right hand side of Poisson eq.
+
+  double *xgrid = (double *)malloc(NX * sizeof(double));
+  double *ygrid = (double *)malloc(NY * sizeof(double));
+  double *diff = (double *)malloc(NX * NY * sizeof(double));
+
+  double *d_u, *d_ue, *d_uo, *d_rh, *d_xgrid, *d_ygrid, *d_diff;
+  
+  //Allocate device Memory
+  cudaMalloc((void**)&d_u, NX * NY * sizeof(double));
+  cudaMalloc((void**)&d_ue, NX * NY * sizeof(double));
+  cudaMalloc((void**)&d_uo, NX * NY * sizeof(double));
+  cudaMalloc((void**)&d_rh, NX * NY * sizeof(double));
+  cudaMalloc((void**)&d_xgrid, NX * sizeof(double));
+  cudaMalloc((void**)&d_ygrid, NY * sizeof(double));
+  cudaMalloc((void**)&d_diff, NX * NY * sizeof(double));
+
+
+
+  const double xstart = -1.0;
+  const double ystart = -1.0;
+  const double xend = 1.0;
+  const double yend = 1.0;
+
+  const double dx = (xend - xstart) / (NX - 1);
+  const double dy = (yend - ystart) / (NY - 1);
+
+  
+
+  // Grid
+  for (int i = 0; i < NX; ++i) {
+    xgrid[i] = xstart + i * dx;
+  }
+
+  for (int j = 0; j < NY; ++j) {
+    ygrid[j] = ystart + j * dy;
+  }
+
+  // rhs
+  for (int j = 0; j < NY; ++j) {
+    for (int i = 0; i < NX; ++i) {
+      rh[indx(i, j)] =
+          2 * (M_PI * M_PI) * sin(M_PI * xgrid[i]) * cos(M_PI * ygrid[j]);
+    }
+  }
+
+  // Exact solution
+  for (int j = 0; j < NY; ++j) {
+    for (int i = 0; i < NX; ++i) {
+      ue[indx(i, j)] = sin(M_PI * xgrid[i]) * cos(M_PI * ygrid[j]);
+    }
+  }
+
+  // Initialize
+  for (int j = 0; j < NY; ++j) {
+    for (int i = 0; i < NX; ++i) {
+      if (i == 0 || i == NX - 1 || j == 0 || j == NY - 1) {
+        u[indx(i, j)] = ue[indx(i, j)];
+      } else {
+        u[indx(i, j)] = 0.0;
+      }
+    }
+  }
+
+  //Transfer data from host to device memory
+
+  cudaMemcpy(d_xgrid, xgrid, NX*NY*sizeof(double), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_ygrid, ygrid, NX*NY*sizeof(double), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_rh, rh, NX*NY*sizeof(double), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_ue, ue, NX*NY*sizeof(double), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_u, u, NX*NY*sizeof(double), cudaMemcpyHostToDevice);
+
+  int cnt =0;
+  int *counter =&cnt;
+
+  sweep<<<1,1>>>(d_u, d_uo, d_rh, dx, d_diff,counter);
+  //cudaDeviceSynchronize();
+
+  //Transfer data back to host memory
+  cudaMemcpy(u, d_u, NX*NY*sizeof(double), cudaMemcpyHostToDevice); 
+  cudaMemcpy(diff, d_diff, NX*NY*sizeof(double), cudaMemcpyHostToDevice);
+
+ 
+  
+  for(int i=0;i<*counter;i++){
+	std::cout<<"Iteration = "<<i<<" "<<diff[i]<<std::endl;
+  }
+  double me = mynorm(u, ue, NX*NY); // max. error in sol.
+
+  std::cout << "Finally Iterations = " << counter << "; max error = " << me << std::endl;
+
+  clock_t end = clock();
+ 
+    // calculate elapsed time by finding difference (end - begin) and
+    // dividing the difference by CLOCKS_PER_SEC to convert to seconds
+    time_spent += (double)(end - begin) / CLOCKS_PER_SEC;
+ 
+    printf("The elapsed time is %f seconds", time_spent);
+
+  //Dellocate Device Memory
+  cudaFree(d_u);
+  cudaFree(d_ue);
+  cudaFree(d_uo);
+  cudaFree(d_rh);
+  cudaFree(d_xgrid);
+  cudaFree(d_ygrid);
+  cudaFree(d_diff);
+
+  free(u);
+  free(ue);
+  free(uo);
+  free(rh);
+  free(xgrid);
+  free(ygrid);
+  free(diff);
+}
